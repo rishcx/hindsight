@@ -728,6 +728,69 @@ class TestOracleQueryRewriter:
         query, _, _ = _rewrite_pg_to_oracle("SELECT now() AT TIME ZONE 'UTC'")
         assert query == "SELECT SYS_EXTRACT_UTC(SYSTIMESTAMP)"
 
+    def test_date_trunc_plain_column(self):
+        from hindsight_api.engine.db.oracle import _rewrite_pg_to_oracle
+
+        query, _, _ = _rewrite_pg_to_oracle("SELECT date_trunc('hour', created_at AT TIME ZONE 'UTC') AS b FROM t")
+        assert query == "SELECT TRUNC(CAST(created_at AS DATE), 'HH24') AS b FROM t"
+        query, _, _ = _rewrite_pg_to_oracle("SELECT date_trunc('day', started_at) AS b FROM t")
+        assert query == "SELECT TRUNC(CAST(started_at AS DATE), 'DD') AS b FROM t"
+
+    def test_date_trunc_nested_expression_6787(self):
+        # The event-time fields of memories-timeseries bucket on COALESCE(field, created_at); a
+        # regex ending at the first ")" put CAST(... AS DATE) inside the COALESCE.
+        from hindsight_api.engine.db.oracle import _rewrite_pg_to_oracle
+
+        query, _, _ = _rewrite_pg_to_oracle(
+            "SELECT date_trunc('day', COALESCE(mentioned_at, created_at) AT TIME ZONE 'UTC') AS bucket "
+            "FROM memory_units WHERE COALESCE(mentioned_at, created_at) >= $2 GROUP BY bucket"
+        )
+        assert query == (
+            "SELECT TRUNC(CAST(COALESCE(mentioned_at, created_at) AS DATE), 'DD') AS bucket "
+            "FROM memory_units WHERE COALESCE(mentioned_at, created_at) >= :2 GROUP BY bucket"
+        )
+
+    def test_date_trunc_multiple_and_nested_calls(self):
+        from hindsight_api.engine.db.oracle import _rewrite_pg_to_oracle
+
+        query, _, _ = _rewrite_pg_to_oracle(
+            "SELECT date_trunc('day', COALESCE(a, b)) AS x, DATE_TRUNC('month', c) AS y, "
+            "date_trunc('week', date_trunc('day', d)) AS z FROM t"
+        )
+        assert query == (
+            "SELECT TRUNC(CAST(COALESCE(a, b) AS DATE), 'DD') AS x, TRUNC(CAST(c AS DATE), 'MM') AS y, "
+            "TRUNC(CAST(TRUNC(CAST(d AS DATE), 'DD') AS DATE), 'IW') AS z FROM t"
+        )
+
+    def test_date_trunc_ignores_parens_inside_string_literals(self):
+        from hindsight_api.engine.db.oracle import _rewrite_pg_to_oracle
+
+        query, _, _ = _rewrite_pg_to_oracle(
+            "SELECT date_trunc('day', NVL(x, ')')) AS b, date_trunc('day', NVL(y, 'it''s )')) FROM t"
+        )
+        assert query == (
+            "SELECT TRUNC(CAST(NVL(x, ')') AS DATE), 'DD') AS b, TRUNC(CAST(NVL(y, 'it''s )') AS DATE), 'DD') FROM t"
+        )
+
+    def test_date_trunc_units(self):
+        from hindsight_api.engine.db.oracle import _DATE_TRUNC_MAP, _rewrite_pg_to_oracle
+
+        for unit, fmt in _DATE_TRUNC_MAP.items():
+            query, _, _ = _rewrite_pg_to_oracle(f"SELECT date_trunc('{unit}', COALESCE(a, b)) FROM t")
+            assert query == f"SELECT TRUNC(CAST(COALESCE(a, b) AS DATE), '{fmt}') FROM t"
+
+    def test_date_trunc_unbalanced_is_left_alone(self):
+        from hindsight_api.engine.db.oracle import _rewrite_pg_to_oracle
+
+        query, _, _ = _rewrite_pg_to_oracle("SELECT date_trunc('day', COALESCE(a, b) FROM t")
+        assert query == "SELECT date_trunc('day', COALESCE(a, b) FROM t"
+
+    def test_date_trunc_word_boundary(self):
+        from hindsight_api.engine.db.oracle import _rewrite_pg_to_oracle
+
+        query, _, _ = _rewrite_pg_to_oracle("SELECT my_date_trunc('day', a) FROM t")
+        assert query == "SELECT my_date_trunc('day', a) FROM t"
+
     def test_gen_random_uuid(self):
         from hindsight_api.engine.db.oracle import _rewrite_pg_to_oracle
 

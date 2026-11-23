@@ -341,6 +341,72 @@ def _rewrite_upsert_to_merge(query: str) -> str | None:
     return merge_query
 
 
+_DATE_TRUNC_MAP = {"day": "DD", "hour": "HH24", "month": "MM", "week": "IW", "year": "YYYY", "minute": "MI"}
+_DATE_TRUNC_START_RE = re.compile(r"\bdate_trunc\s*\(\s*'(\w+)'\s*,", re.IGNORECASE)
+_TRAILING_AT_TIME_ZONE_RE = re.compile(r"\s+AT\s+TIME\s+ZONE\s+'[^']*'\s*$", re.IGNORECASE)
+
+
+def _find_closing_paren(s: str, pos: int) -> int | None:
+    """Index of the ``)`` closing a call whose ``(`` is just before ``pos``, else None.
+
+    Counts nested parentheses and skips single-quoted literals (``''`` is an escaped
+    quote), so ``COALESCE(a, ')')`` does not end the call early.
+    """
+    depth = 1
+    i = pos
+    while i < len(s):
+        ch = s[i]
+        if ch == "'":
+            i += 1
+            while i < len(s):
+                if s[i] == "'":
+                    if s[i + 1 : i + 2] == "'":
+                        i += 2
+                        continue
+                    break
+                i += 1
+            else:
+                return None  # unterminated literal
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return None
+
+
+def _rewrite_date_trunc_calls(query: str) -> str:
+    """``date_trunc('unit', expr)`` → ``TRUNC(CAST(expr AS DATE), 'fmt')``.
+
+    ``expr`` may itself contain parentheses (``COALESCE(a, b)``) or another
+    ``date_trunc``, so the call's end is found by balancing parentheses — a regex
+    ending at the first ``)`` cuts a nested expression in half (#6787). A trailing
+    ``AT TIME ZONE '<tz>'`` is dropped: Oracle timestamps are already in the session
+    timezone. A call whose parentheses do not balance is left as written.
+    """
+    out: list[str] = []
+    pos = 0
+    while True:
+        m = _DATE_TRUNC_START_RE.search(query, pos)
+        if m is None:
+            out.append(query[pos:])
+            return "".join(out)
+        end = _find_closing_paren(query, m.end())
+        if end is None:
+            # Unbalanced: keep this call's text and keep scanning past it.
+            out.append(query[pos : m.end()])
+            pos = m.end()
+            continue
+        expr = _rewrite_date_trunc_calls(query[m.end() : end]).strip()
+        expr = _TRAILING_AT_TIME_ZONE_RE.sub("", expr)
+        fmt = _DATE_TRUNC_MAP.get(m.group(1).lower(), "DD")
+        out.append(query[pos : m.start()])
+        out.append(f"TRUNC(CAST({expr} AS DATE), '{fmt}')")
+        pos = end + 1
+
+
 def _rewrite_pg_to_oracle(query: str) -> RewriteResult:
     """Rewrite PostgreSQL-style SQL to Oracle-compatible SQL.
 
@@ -459,20 +525,8 @@ def _rewrite_pg_to_oracle(query: str) -> RewriteResult:
     # Use negative lookbehind/lookahead to skip already-quoted occurrences.
     query = re.sub(r'(?<!")\btrigger\b(?!")', '"trigger"', query)
 
-    # date_trunc('interval', expr) → TRUNC(expr, 'fmt')
-    # The second capture group is a balanced expression (not just a column name)
-    # to handle e.g. date_trunc('hour', created_at AT TIME ZONE 'UTC').
-    _DATE_TRUNC_MAP = {"day": "DD", "hour": "HH24", "month": "MM", "week": "IW", "year": "YYYY", "minute": "MI"}
-
-    def _rewrite_date_trunc(m):
-        interval = m.group(1).lower()
-        expr = m.group(2).strip()
-        # Strip AT TIME ZONE — Oracle timestamps are already in the session timezone.
-        expr = re.sub(r"\s+AT\s+TIME\s+ZONE\s+'[^']*'", "", expr, flags=re.IGNORECASE)
-        fmt = _DATE_TRUNC_MAP.get(interval, "DD")
-        return f"TRUNC(CAST({expr} AS DATE), '{fmt}')"
-
-    query = re.sub(r"date_trunc\(\s*'(\w+)'\s*,\s*(.+?)\s*\)", _rewrite_date_trunc, query, flags=re.IGNORECASE)
+    # date_trunc('interval', expr) → TRUNC(CAST(expr AS DATE), 'fmt')
+    query = _rewrite_date_trunc_calls(query)
 
     # interval 'N units' → NUMTODSINTERVAL(N, 'UNIT')
     # Handles PG interval literals like interval '7 days', interval '1 hour', etc.

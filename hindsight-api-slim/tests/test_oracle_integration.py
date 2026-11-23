@@ -12,7 +12,7 @@ import asyncio
 import json
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, NoReturn
 
 import pytest
@@ -1235,6 +1235,72 @@ class TestAdvancedFeatures:
             )
             tags = await oracle_memory.list_tags(bank_id=bank_id, request_context=request_context)
             assert len(tags) > 0
+        finally:
+            await _safe_cleanup(oracle_memory, bank_id, request_context)
+
+    @pytest.mark.asyncio
+    async def test_memories_timeseries_event_time_fields(
+        self, oracle_memory: MemoryEngine, request_context: RequestContext
+    ):
+        """#6787: bucketing on mentioned_at / occurred_start (COALESCE(field, created_at)).
+
+        The PG->Oracle ``date_trunc`` rewrite cut ``COALESCE(a, b)`` at its first ``)`` and
+        sent invalid SQL, so only the ``created_at`` default worked. Rows that lack the
+        event timestamp must fall back to their own ``created_at`` (today's bucket).
+        """
+        bank_id = _bank_id("tseries")
+        dim = oracle_memory.embeddings.dimension
+        now = datetime.now(timezone.utc)
+        # Midday, so the UTC day is the same whatever offset the session time zone has.
+        mentioned = (now - timedelta(days=3)).replace(hour=12, minute=0, second=0, microsecond=0)
+        occurred = (now - timedelta(days=5)).replace(hour=12, minute=0, second=0, microsecond=0)
+        # A has mentioned_at only, B has occurred_start only, C has neither.
+        fact_types = ["world", "experience", "world"]
+        n = len(fact_types)
+        try:
+            await oracle_memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
+            backend = await oracle_memory._get_backend()
+            async with backend.transaction() as conn:
+                await backend.ops.insert_facts_batch(
+                    conn,
+                    bank_id,
+                    fact_texts=[f"fact {i}" for i in range(n)],
+                    embeddings=[embedding_to_pgvector([1.0] + [0.0] * (dim - 1))] * n,
+                    event_dates=[datetime(2024, 1, 1, tzinfo=timezone.utc)] * n,
+                    occurred_starts=[None, occurred, None],
+                    occurred_ends=[None] * n,
+                    mentioned_ats=[mentioned, None, None],
+                    contexts=[""] * n,
+                    fact_types=fact_types,
+                    metadata_jsons=["{}"] * n,
+                    chunk_ids=[None] * n,
+                    document_ids=[None] * n,
+                    tags_list=["[]"] * n,
+                    observation_scopes_list=[None] * n,
+                    text_signals_list=[None] * n,
+                    attachment_ids_list=[None] * n,
+                )
+
+            async def counts(time_field: str) -> dict[str, tuple[int, int]]:
+                body = await oracle_memory.get_memories_timeseries(
+                    bank_id, period="7d", time_field=time_field, request_context=request_context
+                )
+                assert body["time_field"] == time_field
+                return {
+                    b["time"][:10]: (b["world"], b["experience"])
+                    for b in body["buckets"]
+                    if b["world"] or b["experience"] or b["observation"]
+                }
+
+            today = now.strftime("%Y-%m-%d")
+            mentioned_day = mentioned.strftime("%Y-%m-%d")
+            occurred_day = occurred.strftime("%Y-%m-%d")
+
+            assert await counts("created_at") == {today: (2, 1)}
+            # A moves to its mentioned_at day; B and C fall back to created_at.
+            assert await counts("mentioned_at") == {mentioned_day: (1, 0), today: (1, 1)}
+            # B moves to its occurred_start day; A and C fall back to created_at.
+            assert await counts("occurred_start") == {occurred_day: (0, 1), today: (2, 0)}
         finally:
             await _safe_cleanup(oracle_memory, bank_id, request_context)
 
