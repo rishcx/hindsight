@@ -1,0 +1,165 @@
+name: oracle-6787-proof
+# Scratch workflow (NOT part of the PR): run the #6787 integration test on a real
+# Oracle Free container, once with upstream's oracle.py and once with the fix.
+on:
+  push:
+    branches: [ proof/oracle-6787 ]
+
+jobs:
+  proof:
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [original, fixed]
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      HINDSIGHT_API_LLM_PROVIDER: mock
+      HINDSIGHT_API_DATABASE_BACKEND: oracle
+      HINDSIGHT_API_EMBEDDINGS_PROVIDER: local
+      ORACLE_TEST_DSN: oracle+oracledb://hindsight_test:hindsight_test@localhost:1521/FREEPDB1
+    services:
+      oracle:
+        image: container-registry.oracle.com/database/free:latest
+        env:
+          ORACLE_PWD: oracle
+        ports:
+          - 1521:1521
+        options: >-
+          --health-cmd "echo 'SELECT 1 FROM DUAL;' | sqlplus -s system/oracle@localhost:1521/FREEPDB1 || exit 1"
+          --health-interval 30s
+          --health-timeout 10s
+          --health-retries 10
+          --health-start-period 120s
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        fetch-depth: 0
+
+    - name: Select oracle.py variant
+      run: |
+        if [ "${{ matrix.variant }}" = "original" ]; then
+          git checkout f64e7b7ce -- hindsight-api-slim/hindsight_api/engine/db/oracle.py
+        fi
+        echo "variant=${{ matrix.variant }}"
+        git diff --stat HEAD -- hindsight-api-slim/hindsight_api/engine/db/oracle.py || true
+        grep -c "_rewrite_date_trunc_calls" hindsight-api-slim/hindsight_api/engine/db/oracle.py || true
+
+    - name: Free Disk Space
+      uses: jlumbroso/free-disk-space@main
+      with:
+        tool-cache: false
+        android: true
+        dotnet: true
+        haskell: true
+        large-packages: false
+        docker-images: false
+        swap-storage: true
+
+    - name: Setup Oracle test user
+      run: |
+        pip install oracledb
+        python3 -c "
+        import oracledb
+        conn = oracledb.connect(user='system', password='oracle', dsn='localhost:1521/FREEPDB1')
+        cursor = conn.cursor()
+        cursor.execute(\"\"\"
+            CREATE BIGFILE TABLESPACE hindsight_ts
+            DATAFILE 'hindsight_ts.dbf' SIZE 2G AUTOEXTEND ON NEXT 500M MAXSIZE UNLIMITED
+            EXTENT MANAGEMENT LOCAL
+            SEGMENT SPACE MANAGEMENT AUTO
+        \"\"\")
+        cursor.execute(\"\"\"
+            CREATE USER hindsight_test IDENTIFIED BY hindsight_test
+            DEFAULT TABLESPACE hindsight_ts
+            TEMPORARY TABLESPACE temp
+            QUOTA UNLIMITED ON hindsight_ts
+        \"\"\")
+        cursor.execute('GRANT CONNECT, RESOURCE, CREATE TABLE, CREATE SEQUENCE, CREATE VIEW, CREATE PROCEDURE TO hindsight_test')
+        cursor.execute('GRANT CTXAPP TO hindsight_test')
+        conn.commit()
+        conn.close()
+        print('Oracle test user created successfully')
+        "
+
+    - name: Show the Oracle version we are testing against
+      run: |
+        python3 -c "
+        import oracledb
+        c = oracledb.connect(user='system', password='oracle', dsn='localhost:1521/FREEPDB1')
+        cur = c.cursor()
+        cur.execute('SELECT banner_full FROM v\$version')
+        print(cur.fetchone()[0])
+        cur.execute(\"SELECT sessiontimezone, dbtimezone FROM dual\")
+        print('sessiontimezone, dbtimezone =', cur.fetchone())
+        "
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v7
+      with:
+        enable-cache: true
+        prune-cache: false
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version-file: ".python-version"
+
+    - name: Install dependencies
+      working-directory: ./hindsight-api-slim
+      run: uv sync --frozen --all-extras --index-strategy unsafe-best-match
+
+    - name: Pre-download models
+      working-directory: ./hindsight-api-slim
+      run: |
+        uv run python -c "
+        from sentence_transformers import SentenceTransformer, CrossEncoder
+        SentenceTransformer('BAAI/bge-small-en-v1.5')
+        CrossEncoder('hindsight-ai/hs-rerank-1')
+        "
+
+    - name: What the rewriter emits for the #6787 query
+      working-directory: ./hindsight-api-slim
+      run: |
+        uv run python -c "
+        from hindsight_api.engine.db.oracle import _rewrite_pg_to_oracle
+        q = \"SELECT date_trunc('day', COALESCE(mentioned_at, created_at) AT TIME ZONE 'UTC') AS bucket FROM memory_units\"
+        print(_rewrite_pg_to_oracle(q).query)
+        "
+
+    - name: "TARGET: memories-timeseries on mentioned_at / occurred_start (real Oracle)"
+      id: target
+      working-directory: ./hindsight-api-slim
+      continue-on-error: true
+      run: |
+        set -o pipefail
+        uv run pytest tests/test_oracle_integration.py -k test_memories_timeseries_event_time_fields \
+          -m oracle -n0 -v -p no:cacheprovider 2>&1 | tee /tmp/target.log
+
+    - name: "REGRESSION: all of tests/test_oracle_integration.py (real Oracle)"
+      id: regression
+      working-directory: ./hindsight-api-slim
+      continue-on-error: true
+      run: |
+        set -o pipefail
+        uv run pytest tests/test_oracle_integration.py -m oracle -n0 -p no:cacheprovider -q 2>&1 | tee /tmp/regression.log
+
+    - name: Summary
+      if: always()
+      run: |
+        {
+          echo "## variant: ${{ matrix.variant }}"
+          echo "- target test outcome: **${{ steps.target.outcome }}**"
+          echo "- full test_oracle_integration.py outcome: **${{ steps.regression.outcome }}**"
+          echo '```'
+          grep -E "passed|failed|error" /tmp/target.log | tail -3
+          grep -E "^(FAILED|ERROR)|passed|failed" /tmp/regression.log | tail -40
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+        cat /tmp/target.log | grep -E "ORA-[0-9]+" | head -5 || true
+
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: logs-${{ matrix.variant }}
+        path: /tmp/*.log
